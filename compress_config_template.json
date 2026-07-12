@@ -1,0 +1,27 @@
+{
+    "name": "custom",
+    "description": "自定义压缩配置",
+
+    "jpeg_quality": 65,
+
+    "downsample_color": true,
+    "color_dpi_threshold": 225,
+    "color_dpi_target": 150,
+
+    "downsample_gray": true,
+    "gray_dpi_threshold": 225,
+    "gray_dpi_target": 150,
+
+    "downsample_mono": true,
+    "mono_dpi_threshold": 450,
+    "mono_dpi_target": 300,
+
+    "color_image_compression": "jpeg",
+    "gray_image_compression": "jpeg",
+    "mono_image_compression": "flate",
+
+    "remove_unused_objects": true,
+    "linearize": false,
+    "recompress_flate": true,
+    "clean_metadata": true
+}
