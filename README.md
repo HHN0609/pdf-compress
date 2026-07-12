@@ -5,8 +5,18 @@
 ## 安装
 
 ```bash
+# 创建虚拟环境（推荐，避免依赖冲突）
+python -m venv venv
+
+# 激活虚拟环境
+venv\Scripts\activate.bat    # Windows PowerShell（如被拦截用 .bat）
+source venv/bin/activate     # Mac / Linux
+
+# 安装依赖
 pip install -r requirements.txt
 ```
+
+如果不想用虚拟环境，也可以直接执行 `pip install -r requirements.txt`。
 
 如需最佳压缩效果，可额外安装 [Ghostscript](https://ghostscript.com/releases/gsdnld.html) 并添加到系统 PATH。
 

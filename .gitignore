@@ -1,0 +1,21 @@
+# venv
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 压缩产物
+*__compressed/
+*__compressed.pdf
