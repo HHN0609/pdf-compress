@@ -1,3 +1,5 @@
+[English](./README.en.md) | 简体中文
+
 # PDF 压缩工具
 
 基于 Python 的 PDF 压缩脚本，支持多档位压缩配置，可处理单个文件或批量文件夹。
