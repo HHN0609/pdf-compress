@@ -143,102 +143,73 @@ def compress_with_pikepdf(
 ) -> tuple[int, int]:
     """使用 pikepdf (qpdf) 压缩 PDF，返回 (原始大小, 压缩后大小)。"""
     import pikepdf
+    from PIL import Image
+    from io import BytesIO
 
     pdf = pikepdf.Pdf.open(input_path)
-
     original_size = input_path.stat().st_size
 
-    # 配置压缩选项
-    for page in pdf.pages:
-        _compress_page_images(page, config)
+    page_count = len(pdf.pages)
+    for i, page in enumerate(pdf.pages):
+        _recompress_page_images(page, config, i + 1, page_count)
 
-    # 保存时应用压缩设置
-    save_options = pikepdf.PdfSaveOptions(
-        compress_streams=True,
-        recompress_flate=config.recompress_flate,
-        remove_unused_objects=config.remove_unused_objects,
-        linearize=config.linearize,
-    )
-
-    pdf.save(output_path, options=save_options)
+    pdf.save(output_path, compress_streams=True)
     pdf.close()
 
     compressed_size = output_path.stat().st_size
     return original_size, compressed_size
 
 
-def _compress_page_images(page, config: CompressionConfig):
-    """对页面中的图片进行压缩降采样。"""
-    # pikepdf 可以通过操作 content stream 中的图片对象来压缩
-    # 这里使用 pikepdf 的 image 相关 API
+def _recompress_page_images(page, config: CompressionConfig, page_num: int, total: int):
+    """重新压缩页面中的所有图片。"""
+    from PIL import Image
+    from io import BytesIO
+    import pikepdf
+    from pikepdf import PdfImage
+
+    # page.get_images() 返回图片名称列表（字符串）
     try:
-        for image_name, image in page.images.items():
-            try:
-                _process_image(image, config)
-            except Exception:
-                pass  # 单张图片失败不影响整体
+        image_names = page.get_images()
     except Exception:
-        pass
+        return
 
+    if not image_names:
+        return
 
-def _process_image(image, config: CompressionConfig):
-    """处理单张图片：根据配置进行 DPI 降采样和重新压缩。"""
-    # 对于 JPEG 彩色图片，降低质量
-    # pikepdf 较难直接做 DPI 降采样，需要用 Pillow 辅助
+    # 通过 Resources.XObject 获取实际图片对象
     try:
-        from PIL import Image
-        from io import BytesIO
-        import pikepdf
+        xobjects = page.Resources.XObject
+    except Exception:
+        return
 
-        pil_image = image.as_pil_image()
-        width, height = pil_image.size
+    for name in image_names:
+        try:
+            raw_image = xobjects[name]
 
-        # 判断图片类型
-        mode = pil_image.mode
-        if mode in ("1",):
-            # 单色图
-            downsample = config.downsample_mono
-            threshold = config.mono_dpi_threshold
-            target = config.mono_dpi_target
-        elif mode in ("L", "LA", "P"):
-            # 灰度图
-            downsample = config.downsample_gray
-            threshold = config.gray_dpi_threshold
-            target = config.gray_dpi_target
-        else:
-            # 彩色图
-            downsample = config.downsample_color
-            threshold = config.color_dpi_threshold
-            target = config.color_dpi_target
-
-        # 计算当前 DPI (pikepdf 可能提供 DPI 信息)
-        # 估算物理尺寸，假设 72 DPI 作为默认
-        if downsample and target < threshold:
-            # 简单降采样
-            scale_factor = target / 150.0  # 用 150 作为基准
-            new_width = max(1, int(width * scale_factor))
-            new_height = max(1, int(height * scale_factor))
-
-            if new_width < width and new_height < height:
-                pil_image = pil_image.resize(
-                    (new_width, new_height), Image.LANCZOS
-                )
-
-        # 重新编码为 JPEG
-        if mode not in ("1",):
-            if pil_image.mode in ("RGBA", "LA", "P"):
+            # 用 PdfImage 包装并解码
+            pdf_image = PdfImage(raw_image)
+            pil_image = pdf_image.as_pil_image()
+            mode = pil_image.mode
+            if mode in ("RGBA", "LA", "P", "1"):
                 pil_image = pil_image.convert("RGB")
-            buf = BytesIO()
-            pil_image.save(buf, format="JPEG", quality=config.jpeg_quality)
-            buf.seek(0)
 
-            # 替换图片
-            ext = pikepdf.Stream(pikepdf.Pdf.open(buf).pages[0].images)
-            # 注意：实际替换逻辑取决于 pikepdf 版本
-    except ImportError:
-        pass  # Pillow 不可用时跳过图片重压缩
-    except Exception:
-        pass
+            # 重新编码为 JPEG（目标质量）
+            buf = BytesIO()
+            pil_image.save(buf, format="JPEG", quality=config.jpeg_quality, optimize=True)
+            buf.seek(0)
+            new_data = buf.read()
+
+            # 替换图片流数据并更新色彩空间
+            raw_image.write(new_data)
+            raw_image.Filter = pikepdf.Array([pikepdf.Name.DCTDecode])
+            raw_image.Width = pikepdf.Integer(pil_image.width)
+            raw_image.Height = pikepdf.Integer(pil_image.height)
+            raw_image.BitsPerComponent = pikepdf.Integer(8)
+            raw_image.ColorSpace = pikepdf.Name.DeviceRGB
+        except Exception as e:
+            import sys
+            print(f"    [警告] 图片 {name} 压缩失败: {e}", file=sys.stderr)
+
 
 
 def compress_with_pypdf(
