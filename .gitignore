@@ -18,7 +18,7 @@ Thumbs.db
 
 # 压缩产物
 *__compressed/
-*__compressed.pdf
+__compressed.pdf
 
 # 调试文件
 __debug_test.pdf
