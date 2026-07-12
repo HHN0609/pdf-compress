@@ -9,6 +9,12 @@
 - 多引擎支持（pikepdf/pypdf/ghostscript）
 - 自定义压缩配置
 - 不覆盖源文件，输出文件名自动添加 `__compressed` 后缀
+- 基于实际显示 DPI 的智能降采样（按页面 mediabox 推算图片有效 DPI）
+- 按图片模式分流处理：彩色/灰度/黑白图分别走对应压缩策略
+- AUTO 算法：对彩色/灰度图同时尝试 JPEG 与 Flate，取较小者，避免图表被 JPEG 反向放大
+- 多页共享图片自动去重，避免重复压缩同一对象
+- 安全保护：若重编码后比原始流更大则保留原图，避免对线稿/已优化图造成反效果
+- JPEG 编码使用 progressive + optimize，进一步减小体积
 
 ## 安装
 
@@ -56,11 +62,13 @@ python pdf_compress.py <输入> [选项]
 
 ## 压缩档位
 
-| 档位 | JPEG 质量 | 彩色 DPI | 灰度 DPI | 说明 |
-|------|----------|----------|----------|------|
-| `low` | 90 | 200 | 200 | 轻量压缩，保持最高画质 |
-| `medium` | 65 | 150 | 150 | 平衡压缩，兼顾质量与体积 |
-| `high` | 30 | 100 | 100 | 强力压缩，最小文件体积 |
+| 档位 | JPEG 质量 | 彩色 DPI | 灰度 DPI | 黑白 DPI | 说明 |
+|------|----------|----------|----------|----------|------|
+| `low` | 90 | 200 | 200 | 400 | 轻量压缩，保持最高画质 |
+| `medium` | 65 | 150 | 150 | 300 | 平衡压缩，兼顾质量与体积 |
+| `high` | 30 | 100 | 100 | 200 | 强力压缩，最小文件体积 |
+
+> 默认图片压缩算法为 `AUTO`：对彩色/灰度图同时尝试 JPEG 与 Flate 取较小者，黑白图固定使用 Flate。
 
 ## 使用示例
 
@@ -108,25 +116,31 @@ python pdf_compress.py --list-presets
 | 单行本漫画（平均） | ~200 MB | ~170 MB | 10-15% |
 | **总计** | **9.1 GB** | **7.6 GB** | **17.1%** |
 
+内置测试 PDF 实测（pikepdf 引擎）：
+
+| 文件 | 档位 | 原始大小 | 压缩后 | 压缩率 |
+|------|------|----------|--------|--------|
+| 20th 周年纪念.pdf | medium | 12.5 MB | 5.4 MB | 57.0% |
+| 20th 周年纪念.pdf | high | 12.5 MB | 3.3 MB | 73.6% |
+| NIPS-2017 论文.pdf | medium | 556.1 KB | 524.7 KB | 5.6% |
+| NIPS-2017 论文.pdf | high | 556.1 KB | 457.2 KB | 17.8% |
+
 **说明**：
 - 彩色图片为主的 PDF 压缩效果最佳（可达 70-90%）
 - 已高度压缩的 PDF 或纯文本 PDF 压缩效果有限
 - `medium` 档位平衡质量与体积，适合大多数场景
-- **注意**：对于纯文本 PDF 或已高度优化的文件，压缩后可能略微变大（如 556 KB → 677 KB），这是因为重新编码图片流会引入额外开销。对于这类文件，建议使用 `low` 档位或不压缩。
+- 新版本已内置"重编码后比原图大就保留原图"的保护逻辑，不会出现压缩后文件反而变大的情况
 
 ## 使用建议
 
 | 场景 | 推荐档位 | 说明 |
 |------|---------|------|
 | 漫画/图片为主的 PDF | `medium` 或 `high` | 压缩效果显著，可大幅减小体积 |
-| 学术论文/文档 | `low` | 以文字为主，压缩效果有限，保持较高画质 |
+| 学术论文/文档 | `low` 或 `medium` | 以文字和图表为主，新版本会自动跳过不适合 JPEG 的图 |
 | 扫描件 | `medium` | 平衡压缩率和可读性 |
-| 已高度压缩的 PDF | 不压缩或 `low` | 避免压缩后体积反而增大 |
+| 已高度压缩的 PDF | `low` 或不压缩 | 新版本会自动保留原图，但仍建议用 `low` 减少处理时间 |
 
 ## 常见问题
-
-**Q: 为什么有些文件压缩后反而变大了？**  
-A: 对于纯文本 PDF 或已高度优化的文件，重新编码图片流会引入额外开销。这类文件建议使用 `low` 档位或不压缩。
 
 **Q: 如何选择压缩档位？**  
 A: 
@@ -135,26 +149,45 @@ A:
 - `high`: 适合对画质要求不高，只追求最小体积的场景
 
 **Q: 压缩后的 PDF 画质会受影响吗？**  
-A: 会有一定影响，但 `low` 和 `medium` 档位的影响通常很小。`high` 档位会明显降低图片质量。
+A: 会有一定影响，但 `low` 和 `medium` 档位的影响通常很小。`high` 档位会明显降低图片质量。黑白图固定使用无损 Flate 压缩，画质不受 JPEG 质量影响。
 
 **Q: 支持哪些压缩引擎？**  
 A: 
-- `pikepdf`: 基于 qpdf，压缩效果好，推荐（默认）
-- `pypdf`: 纯 Python 实现，兼容性最好
-- `ghostscript`: 需要单独安装，压缩效果最强
+- `pikepdf`: 基于 qpdf，支持完整的图片重编码、降采样、去重等功能，推荐（默认）
+- `pypdf`: 纯 Python 实现，仅压缩内容流和合并重复对象，不重编码图片
+- `ghostscript`: 需要单独安装，支持完整的 JPEG 质量 + DPI 降采样控制，压缩效果最强
+
+**Q: 多页 PDF 中重复出现的图片会被多次压缩吗？**  
+A: 不会。pikepdf 引擎会按图片对象的 `objgen` 去重，同一张图片只处理一次。
+
+**Q: 已经高度优化的 PDF 还能压缩吗？**  
+A: 可以放心尝试。新版本会对比重编码后的数据与原始流大小，若重编码后反而变大则保留原图，不会出现压缩后文件变大的情况。
 
 ## 自定义配置
 
 参考模板文件 `compress_config_template.json`，可调整以下参数：
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `jpeg_quality` | 0-100 | JPEG 图片质量，越低文件越小 |
-| `color_dpi_target` | int | 彩色图降采样目标 DPI |
-| `gray_dpi_target` | int | 灰度图降采样目标 DPI |
-| `mono_dpi_target` | int | 单色图降采样目标 DPI |
-| `recompress_flate` | bool | 对内部流再压缩 |
-| `remove_unused_objects` | bool | 移除未引用资源 |
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `jpeg_quality` | 0-100 | 85 | JPEG 图片质量，越低文件越小 |
+| `downsample_color` | bool | true | 是否对彩色图降采样 |
+| `color_dpi_threshold` | int | 225 | 彩色图降采样触发阈值（实际 DPI 高于此值才降采样） |
+| `color_dpi_target` | int | 150 | 彩色图降采样目标 DPI |
+| `downsample_gray` | bool | true | 是否对灰度图降采样 |
+| `gray_dpi_threshold` | int | 225 | 灰度图降采样触发阈值 |
+| `gray_dpi_target` | int | 150 | 灰度图降采样目标 DPI |
+| `downsample_mono` | bool | true | 是否对黑白图降采样 |
+| `mono_dpi_threshold` | int | 600 | 黑白图降采样触发阈值 |
+| `mono_dpi_target` | int | 300 | 黑白图降采样目标 DPI |
+| `color_image_compression` | string | `"auto"` | 彩色图压缩算法：`jpeg` / `flate` / `lossless` / `auto` |
+| `gray_image_compression` | string | `"auto"` | 灰度图压缩算法 |
+| `mono_image_compression` | string | `"flate"` | 黑白图压缩算法（建议保持 `flate`） |
+| `remove_unused_objects` | bool | true | 移除未引用资源（启用 object stream） |
+| `linearize` | bool | false | 线性化输出（优化网页渐进加载） |
+| `recompress_flate` | bool | true | 对内部 Flate 流再次压缩 |
+| `clean_metadata` | bool | true | 清理文档元数据 |
+
+> `auto` 算法说明：对彩色/灰度图同时尝试 JPEG 与 Flate 编码，取字节数较小者写回，并对比原始流大小决定是否替换。
 
 ## 工作目录示例
 

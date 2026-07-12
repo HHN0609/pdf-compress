@@ -16,8 +16,8 @@
     "mono_dpi_threshold": 450,
     "mono_dpi_target": 300,
 
-    "color_image_compression": "jpeg",
-    "gray_image_compression": "jpeg",
+    "color_image_compression": "auto",
+    "gray_image_compression": "auto",
     "mono_image_compression": "flate",
 
     "remove_unused_objects": true,
