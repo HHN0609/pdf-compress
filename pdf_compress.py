@@ -17,10 +17,11 @@ PDF 压缩脚本，支持多档位压缩配置。
 
 import argparse
 import json
-import os
 import sys
-from dataclasses import dataclass, field
+import zlib
+from dataclasses import dataclass
 from enum import Enum
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
@@ -61,9 +62,9 @@ class CompressionConfig:
     mono_dpi_threshold: int = 600
     mono_dpi_target: int = 300
 
-    # 图片压缩算法
-    color_image_compression: ImageCompression = ImageCompression.JPEG
-    gray_image_compression: ImageCompression = ImageCompression.JPEG
+    # 图片压缩算法 (默认 AUTO: 对每张图同时尝试 JPEG 与 Flate，取较小者)
+    color_image_compression: ImageCompression = ImageCompression.AUTO
+    gray_image_compression: ImageCompression = ImageCompression.AUTO
     mono_image_compression: ImageCompression = ImageCompression.FLATE
 
     # 移除对象中的未引用资源
@@ -133,6 +134,39 @@ PRESETS: dict[str, CompressionConfig] = {
 
 
 # ──────────────────────────────────────────────
+# 工具函数
+# ──────────────────────────────────────────────
+
+def _fmt_size(size: int) -> str:
+    """把字节数格式化为易读字符串。"""
+    size = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _page_dpi(page, img_w: int, img_h: int) -> Optional[float]:
+    """估算图片在页面上的有效 DPI（假设图片填满页面，保守取较小值）。
+
+    PDF 单位为点 (1/72 英寸)，用 mediabox 尺寸推算图片显示尺寸。
+    无法获取时返回 None。
+    """
+    try:
+        mb = page.mediabox
+        page_w = float(mb[2]) - float(mb[0])
+        page_h = float(mb[3]) - float(mb[1])
+    except Exception:
+        return None
+    if page_w <= 0 or page_h <= 0:
+        return None
+    dpi_w = img_w * 72.0 / page_w
+    dpi_h = img_h * 72.0 / page_h
+    return min(dpi_w, dpi_h)
+
+
+# ──────────────────────────────────────────────
 # 压缩引擎
 # ──────────────────────────────────────────────
 
@@ -144,39 +178,57 @@ def compress_with_pikepdf(
     """使用 pikepdf (qpdf) 压缩 PDF，返回 (原始大小, 压缩后大小)。"""
     import pikepdf
     from PIL import Image
-    from io import BytesIO
 
-    pdf = pikepdf.Pdf.open(input_path)
     original_size = input_path.stat().st_size
 
-    page_count = len(pdf.pages)
-    for i, page in enumerate(pdf.pages):
-        _recompress_page_images(page, config, i + 1, page_count)
+    with pikepdf.Pdf.open(input_path) as pdf:
+        # 同一图片对象可能被多页引用，按 objgen 去重避免重复压缩
+        processed: set[tuple[int, int]] = set()
+        page_count = len(pdf.pages)
+        for i, page in enumerate(pdf.pages):
+            _recompress_page_images(page, config, processed, i + 1, page_count)
 
-    pdf.save(output_path, compress_streams=True)
-    pdf.close()
+        # 清理元数据
+        if config.clean_metadata:
+            try:
+                pdf.docinfo = pikepdf.Dictionary()
+            except Exception:
+                pass
+
+        # 组装 save 参数
+        save_kwargs: dict = {"compress_streams": True}
+        if config.recompress_flate:
+            save_kwargs["recompress_flate"] = True
+        if config.linearize:
+            save_kwargs["linearize"] = True
+        if config.remove_unused_objects:
+            save_kwargs["object_stream_mode"] = pikepdf.ObjectStreamMode.generate
+
+        pdf.save(output_path, **save_kwargs)
 
     compressed_size = output_path.stat().st_size
     return original_size, compressed_size
 
 
-def _recompress_page_images(page, config: CompressionConfig, page_num: int, total: int):
+def _recompress_page_images(
+    page,
+    config: CompressionConfig,
+    processed: set[tuple[int, int]],
+    page_num: int,
+    total: int,
+):
     """重新压缩页面中的所有图片。"""
-    from PIL import Image
-    from io import BytesIO
     import pikepdf
+    from PIL import Image
     from pikepdf import PdfImage
 
-    # page.get_images() 返回图片名称列表（字符串）
     try:
         image_names = page.get_images()
     except Exception:
         return
-
     if not image_names:
         return
 
-    # 通过 Resources.XObject 获取实际图片对象
     try:
         xobjects = page.Resources.XObject
     except Exception:
@@ -185,31 +237,150 @@ def _recompress_page_images(page, config: CompressionConfig, page_num: int, tota
     for name in image_names:
         try:
             raw_image = xobjects[name]
+            # 多页共享图片去重
+            objgen = raw_image.objgen
+            if objgen in processed:
+                continue
+            processed.add(objgen)
 
-            # 用 PdfImage 包装并解码
+            # 记录原始流字节长度，用于"压缩后变大就保留原图"
+            try:
+                original_stream_len = len(raw_image.read_raw_bytes())
+            except Exception:
+                original_stream_len = 0
+
             pdf_image = PdfImage(raw_image)
             pil_image = pdf_image.as_pil_image()
-            mode = pil_image.mode
-            if mode in ("RGBA", "LA", "P", "1"):
-                pil_image = pil_image.convert("RGB")
+            original_mode = pil_image.mode
 
-            # 重新编码为 JPEG（目标质量）
-            buf = BytesIO()
-            pil_image.save(buf, format="JPEG", quality=config.jpeg_quality, optimize=True)
-            buf.seek(0)
-            new_data = buf.read()
+            # 按原图模式分类，决定走彩色/灰度/单色配置
+            category = _classify_mode(original_mode)
 
-            # 替换图片流数据并更新色彩空间
-            raw_image.write(new_data)
-            raw_image.Filter = pikepdf.Array([pikepdf.Name.DCTDecode])
+            # 计算实际 DPI，决定是否降采样
+            cur_dpi = _page_dpi(page, pil_image.width, pil_image.height)
+            pil_image = _maybe_downsample(pil_image, category, cur_dpi, config)
+
+            # 编码并写回
+            data, filt, bpc, colorspace = _encode_image(pil_image, category, config)
+
+            # 若新数据比原始流还大，保留原图（避免对线稿/已优化图造成反效果）
+            if original_stream_len > 0 and len(data) >= original_stream_len:
+                continue
+
+            raw_image.write(data)
+            raw_image.Filter = pikepdf.Array(filt)
             raw_image.Width = pikepdf.Integer(pil_image.width)
             raw_image.Height = pikepdf.Integer(pil_image.height)
-            raw_image.BitsPerComponent = pikepdf.Integer(8)
-            raw_image.ColorSpace = pikepdf.Name.DeviceRGB
+            raw_image.BitsPerComponent = pikepdf.Integer(bpc)
+            raw_image.ColorSpace = colorspace
+            # 重编码后丢失软掩膜，移除引用避免不一致
+            if "SMask" in raw_image:
+                del raw_image.SMask
         except Exception as e:
-            import sys
-            print(f"    [警告] 图片 {name} 压缩失败: {e}", file=sys.stderr)
+            print(f"    [警告] 第 {page_num}/{total} 页 图片 {name} 压缩失败: {e}",
+                  file=sys.stderr)
 
+
+def _classify_mode(mode: str) -> str:
+    """把 PIL 模式归类为 color / gray / mono。"""
+    if mode == "1":
+        return "mono"
+    if mode in ("L", "LA", "I;16"):
+        return "gray"
+    return "color"
+
+
+def _maybe_downsample(pil_image, category: str, cur_dpi, config: CompressionConfig):
+    """按配置对图片降采样，返回 (可能 resize 后的) PIL Image。"""
+    from PIL import Image
+
+    if cur_dpi is None:
+        return pil_image
+
+    if category == "color" and config.downsample_color:
+        threshold, target = config.color_dpi_threshold, config.color_dpi_target
+    elif category == "gray" and config.downsample_gray:
+        threshold, target = config.gray_dpi_threshold, config.gray_dpi_target
+    elif category == "mono" and config.downsample_mono:
+        threshold, target = config.mono_dpi_threshold, config.mono_dpi_target
+    else:
+        return pil_image
+
+    if cur_dpi <= threshold or target <= 0:
+        return pil_image
+
+    scale = target / cur_dpi
+    if scale >= 1.0:
+        return pil_image
+    new_w = max(1, int(round(pil_image.width * scale)))
+    new_h = max(1, int(round(pil_image.height * scale)))
+    return pil_image.resize((new_w, new_h), Image.LANCZOS)
+
+
+def _encode_image(pil_image, category: str, config: CompressionConfig):
+    """根据类别和配置压缩图片。
+
+    返回 (data, filter_list, bits_per_component, colorspace)。
+
+    对于彩色/灰度图，若配置为 AUTO 会同时尝试 JPEG 与 Flate 取较小者，
+    避免对图表/线稿这类不适合 JPEG 的图强行重编码导致体积反增。
+    """
+    import pikepdf
+    from PIL import Image
+
+    def _jpeg(img, quality: int) -> bytes:
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality,
+                 optimize=True, progressive=True)
+        return buf.getvalue()
+
+    def _flate(img) -> bytes:
+        return zlib.compress(img.tobytes())
+
+    def _alg(cat: str) -> ImageCompression:
+        return {
+            "color": config.color_image_compression,
+            "gray": config.gray_image_compression,
+            "mono": config.mono_image_compression,
+        }[cat]
+
+    if category == "mono":
+        # 黑白: 用 Flate (zlib) 压缩 1-bit 像素数据
+        if pil_image.mode != "1":
+            pil_image = pil_image.convert("1")
+        return _flate(pil_image), [pikepdf.Name.FlateDecode], 1, pikepdf.Name.DeviceGray
+
+    if category == "gray":
+        if pil_image.mode != "L":
+            pil_image = pil_image.convert("L")
+        alg = _alg("gray")
+        candidates = []
+        if alg in (ImageCompression.JPEG, ImageCompression.AUTO):
+            candidates.append((_jpeg(pil_image, config.jpeg_quality),
+                               [pikepdf.Name.DCTDecode], 8, pikepdf.Name.DeviceGray))
+        if alg in (ImageCompression.FLATE, ImageCompression.LOSSLESS, ImageCompression.AUTO):
+            candidates.append((_flate(pil_image),
+                               [pikepdf.Name.FlateDecode], 8, pikepdf.Name.DeviceGray))
+        if not candidates:
+            candidates.append((_flate(pil_image),
+                               [pikepdf.Name.FlateDecode], 8, pikepdf.Name.DeviceGray))
+        return min(candidates, key=lambda c: len(c[0]))
+
+    # color
+    if pil_image.mode != "RGB":
+        pil_image = pil_image.convert("RGB")
+    alg = _alg("color")
+    candidates = []
+    if alg in (ImageCompression.JPEG, ImageCompression.AUTO):
+        candidates.append((_jpeg(pil_image, config.jpeg_quality),
+                           [pikepdf.Name.DCTDecode], 8, pikepdf.Name.DeviceRGB))
+    if alg in (ImageCompression.FLATE, ImageCompression.LOSSLESS, ImageCompression.AUTO):
+        candidates.append((_flate(pil_image),
+                           [pikepdf.Name.FlateDecode], 8, pikepdf.Name.DeviceRGB))
+    if not candidates:
+        candidates.append((_flate(pil_image),
+                           [pikepdf.Name.FlateDecode], 8, pikepdf.Name.DeviceRGB))
+    return min(candidates, key=lambda c: len(c[0]))
 
 
 def compress_with_pypdf(
@@ -224,11 +395,35 @@ def compress_with_pypdf(
 
     reader = PdfReader(input_path)
     writer = PdfWriter()
+    # pypdf 6.x: page.compress_content_streams 要求 page 已属于 writer，
+    # 因此用 append 把所有页加入 writer 后再操作 writer.pages
+    writer.append(reader)
 
-    for page in reader.pages:
-        # 对页面内容进行压缩
-        page.compress_content_streams()
-        writer.add_page(page)
+    for page in writer.pages:
+        try:
+            page.compress_content_streams()
+        except Exception:
+            pass
+
+    # 合并重复对象（字体/图片），能进一步减小体积
+    # pypdf 7.0 将重命名参数，这里同时兼容新旧版本
+    try:
+        try:
+            writer.compress_identical_objects(
+                remove_duplicates=True, remove_unreferenced=True
+            )
+        except TypeError:
+            writer.compress_identical_objects(
+                remove_identicals=True, remove_orphans=True
+            )
+    except Exception:
+        pass
+
+    if config.clean_metadata:
+        try:
+            writer.add_metadata({})
+        except Exception:
+            pass
 
     with open(output_path, "wb") as f:
         writer.write(f)
@@ -247,16 +442,19 @@ def compress_with_ghostscript(
 
     original_size = input_path.stat().st_size
 
-    # Ghostscript 压缩预设映射
     quality_map = {
         "low": "/prepress",
         "medium": "/ebook",
         "high": "/screen",
     }
-
     gs_quality = quality_map.get(config.name, "/ebook")
 
-    # JPEG 质量映射到 gs 的 ColorImageFilter 等参数
+    # Ghostscript 的 DownsampleThreshold 是比例值（>1.0 才会触发降采样）
+    def _threshold_ratio(threshold: int, target: int) -> str:
+        if target <= 0:
+            return "1.5"
+        return f"{threshold / target:.2f}"
+
     args = [
         "gs",
         "-sDEVICE=pdfwrite",
@@ -265,14 +463,31 @@ def compress_with_ghostscript(
         "-dNOPAUSE",
         "-dQUIET",
         "-dBATCH",
+        f"-dJPEGQ={config.jpeg_quality}",
+        # 彩色图
+        "-dDownsampleColorImages=true",
+        "-dAutoFilterColorImages=false",
+        "-dColorImageFilter=/DCTEncode",
+        f"-dColorImageResolution={config.color_dpi_target}",
+        f"-dColorImageDownsampleThreshold={_threshold_ratio(config.color_dpi_threshold, config.color_dpi_target)}",
+        "-dColorImageDownsampleType=/Bicubic",
+        # 灰度图
+        "-dDownsampleGrayImages=true",
+        "-dAutoFilterGrayImages=false",
+        "-dGrayImageFilter=/DCTEncode",
+        f"-dGrayImageResolution={config.gray_dpi_target}",
+        f"-dGrayImageDownsampleThreshold={_threshold_ratio(config.gray_dpi_threshold, config.gray_dpi_target)}",
+        "-dGrayImageDownsampleType=/Bicubic",
+        # 单色图
+        "-dDownsampleMonoImages=true",
+        f"-dMonoImageResolution={config.mono_dpi_target}",
+        f"-dMonoImageDownsampleThreshold={_threshold_ratio(config.mono_dpi_threshold, config.mono_dpi_target)}",
+        "-dMonoImageDownsampleType=/Bicubic",
+        "-dEmbedAllFonts=true",
+        "-dSubsetFonts=true",
         f"-sOutputFile={output_path}",
         str(input_path),
     ]
-
-    # 根据配置精细化控制
-    if config.jpeg_quality:
-        args.insert(4, f"-dColorImageCompression=/DCTEncode")
-        args.insert(5, f"-dColorImageCompressionQuality={config.jpeg_quality}")
 
     subprocess.run(args, check=True, capture_output=True)
 
@@ -304,7 +519,6 @@ def compress_folder(
     if not folder_path.is_dir():
         raise NotADirectoryError(f"不是文件夹: {folder_path}")
 
-    # 收集顶层 PDF 文件
     pdf_files = sorted(
         p for p in folder_path.iterdir()
         if p.is_file() and p.suffix.lower() == ".pdf"
@@ -313,7 +527,6 @@ def compress_folder(
     if not pdf_files:
         raise FileNotFoundError(f"文件夹 {folder_path} 中没有 PDF 文件")
 
-    # 创建输出文件夹
     output_dir = folder_path.parent / (folder_path.name + "__compressed")
     output_dir.mkdir(exist_ok=True)
 
@@ -339,33 +552,19 @@ def compress_folder(
             total_compressed += compressed
             success += 1
 
-            def fmt(size: int) -> str:
-                for unit in ("B", "KB", "MB", "GB"):
-                    if size < 1024:
-                        return f"{size:.1f} {unit}"
-                    size /= 1024
-                return f"{size:.1f} TB"
-
             ratio = (1 - compressed / original) * 100 if original > 0 else 0
             print(f"  [{success}/{len(pdf_files)}] {pdf_file.name}")
-            print(f"         {fmt(original)} -> {fmt(compressed)}  ({ratio:.1f}%)")
+            print(f"         {_fmt_size(original)} -> {_fmt_size(compressed)}  ({ratio:.1f}%)")
         except Exception as e:
             failed.append((pdf_file.name, str(e)))
             print(f"  [失败] {pdf_file.name}: {e}")
 
-    # 汇总
     print(f"\n{'─'*50}")
     print(f"  汇总: 成功 {success}/{len(pdf_files)}")
 
     if total_original > 0:
         total_ratio = (1 - total_compressed / total_original) * 100
-        def fmt(size: int) -> str:
-            for unit in ("B", "KB", "MB", "GB"):
-                if size < 1024:
-                    return f"{size:.1f} {unit}"
-                size /= 1024
-            return f"{size:.1f} TB"
-        print(f"  总计: {fmt(total_original)} -> {fmt(total_compressed)}  ({total_ratio:.1f}%)")
+        print(f"  总计: {_fmt_size(total_original)} -> {_fmt_size(total_compressed)}  ({total_ratio:.1f}%)")
 
     if failed:
         print(f"  失败文件:")
@@ -385,24 +584,23 @@ def _compress_single_file(
     engine: str,
 ) -> tuple[int, int]:
     """压缩单个 PDF 文件，返回 (原始大小, 压缩后大小)。"""
-    original_size = input_path.stat().st_size
+    return _dispatch_engine(input_path, output_path, config, engine)
 
+
+def _dispatch_engine(
+    input_path: Path,
+    output_path: Path,
+    config: CompressionConfig,
+    engine: str,
+) -> tuple[int, int]:
+    """根据 engine 选择并调用具体压缩实现。"""
     chosen_engine = _select_engine(engine)
 
     if chosen_engine == "ghostscript":
-        _, compressed_size = compress_with_ghostscript(
-            input_path, output_path, config
-        )
-    elif chosen_engine == "pikepdf":
-        _, compressed_size = compress_with_pikepdf(
-            input_path, output_path, config
-        )
-    else:
-        _, compressed_size = compress_with_pypdf(
-            input_path, output_path, config
-        )
-
-    return original_size, compressed_size
+        return compress_with_ghostscript(input_path, output_path, config)
+    if chosen_engine == "pikepdf":
+        return compress_with_pikepdf(input_path, output_path, config)
+    return compress_with_pypdf(input_path, output_path, config)
 
 
 # ──────────────────────────────────────────────
@@ -433,26 +631,11 @@ def compress_pdf(
     if input_path.suffix.lower() != ".pdf":
         raise ValueError(f"不是 PDF 文件: {input_path}")
 
-    # 输出路径：未指定则在原文件名后加 __compressed
     if output_path is None:
         output_path = input_path.parent / (input_path.stem + "__compressed" + input_path.suffix)
 
-    # 选择引擎
     chosen_engine = _select_engine(engine)
-
-    # 执行压缩
-    if chosen_engine == "ghostscript":
-        original, compressed = compress_with_ghostscript(
-            input_path, output_path, config
-        )
-    elif chosen_engine == "pikepdf":
-        original, compressed = compress_with_pikepdf(
-            input_path, output_path, config
-        )
-    else:
-        original, compressed = compress_with_pypdf(
-            input_path, output_path, config
-        )
+    original, compressed = _dispatch_engine(input_path, output_path, config, engine)
 
     _print_result(original, compressed, output_path, config, chosen_engine)
     return output_path
@@ -464,7 +647,6 @@ def _select_engine(preferred: str) -> str:
         _check_engine_available(preferred)
         return preferred
 
-    # 自动检测
     for engine in ("ghostscript", "pikepdf", "pypdf"):
         if _engine_available(engine):
             return engine
@@ -476,7 +658,7 @@ def _engine_available(engine: str) -> bool:
     try:
         _check_engine_available(engine)
         return True
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         return False
 
 
@@ -494,17 +676,13 @@ def _check_engine_available(engine: str):
     elif engine == "ghostscript":
         import subprocess
         try:
-            subprocess.run(
-                ["gs", "--version"],
-                check=True,
-                capture_output=True,
-                shell=True,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
+            # 注意: 传 list 时不应使用 shell=True，否则在 Linux 上行为不可预期
+            subprocess.run(["gs", "--version"], check=True, capture_output=True)
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
             raise RuntimeError(
                 "Ghostscript 未安装或不在 PATH 中。"
                 "请从 https://ghostscript.com/releases/gsdnld.html 下载安装。"
-            )
+            ) from e
     else:
         raise ValueError(f"未知引擎: {engine}")
 
@@ -519,17 +697,10 @@ def _print_result(
     """打印压缩结果。"""
     ratio = (1 - compressed / original) * 100 if original > 0 else 0
 
-    def fmt(size: int) -> str:
-        for unit in ("B", "KB", "MB", "GB"):
-            if size < 1024:
-                return f"{size:.1f} {unit}"
-            size /= 1024
-        return f"{size:.1f} TB"
-
     print(f"\n{'─'*50}")
     print(f"  压缩完成!")
-    print(f"  原始大小:  {fmt(original):>10}")
-    print(f"  压缩后:    {fmt(compressed):>10}")
+    print(f"  原始大小:  {_fmt_size(original):>10}")
+    print(f"  压缩后:    {_fmt_size(compressed):>10}")
     print(f"  压缩率:    {ratio:>9.1f}%")
     print(f"  使用引擎:  {engine}")
     print(f"  压缩档位:  {config.name} ({config.description})")
@@ -557,7 +728,6 @@ def load_config_from_file(config_path: Path) -> CompressionConfig:
     with open(config_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # 处理枚举字段
     for field_name in (
         "color_image_compression",
         "gray_image_compression",
@@ -566,7 +736,6 @@ def load_config_from_file(config_path: Path) -> CompressionConfig:
         if field_name in data and isinstance(data[field_name], str):
             data[field_name] = ImageCompression(data[field_name])
 
-    # 覆盖默认配置
     config = CompressionConfig(
         name="custom",
         description="自定义配置",
@@ -634,19 +803,16 @@ def main():
 
     args = parser.parse_args()
 
-    # 列出档位
     if args.list_presets:
         _list_presets()
         return
 
-    # 输入文件必填
     if not args.input:
         parser.print_help()
         sys.exit(1)
 
     input_path = Path(args.input)
 
-    # 加载配置
     if args.config:
         config = load_config_from_file(args.config)
     else:
@@ -654,7 +820,6 @@ def main():
 
     try:
         if input_path.is_dir():
-            # 文件夹模式：不允许指定 -o
             if args.output:
                 print("[错误] 文件夹模式下不能使用 -o/--output 参数", file=sys.stderr)
                 sys.exit(1)
